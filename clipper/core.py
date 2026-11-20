@@ -1,0 +1,406 @@
+from __future__ import annotations
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+import uuid
+from pathlib import Path
+from urllib.parse import urlparse
+
+import requests
+from dotenv import load_dotenv
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA = ROOT / "data"
+DATA.mkdir(exist_ok=True)
+load_dotenv(ROOT / ".env")
+
+
+def config(name, default):
+    return os.getenv(name, str(default))
+
+
+def run(command, cwd=None):
+    result = subprocess.run([str(x) for x in command], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if result.returncode:
+        raise RuntimeError(f"Command failed: {' '.join(map(str, command[:3]))}\n{result.stderr[-3500:]}")
+    return result.stdout
+
+
+def need_binaries():
+    missing = [name for name in ("ffmpeg", "ffprobe") if not shutil.which(name)]
+    if missing:
+        raise RuntimeError("Missing programs in PATH: " + ", ".join(missing) + ". Install FFmpeg and restart terminal.")
+
+
+def validate_url(url):
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in ("https", "http") or not parsed.hostname:
+        raise ValueError("Use a valid HTTP(S) video URL.")
+    host = parsed.hostname.lower().rstrip(".")
+    allowed = ("youtube.com", "youtu.be", "twitch.tv", "facebook.com", "fb.watch", "m.facebook.com", "youtube-nocookie.com")
+    if not any(host == h or host.endswith("." + h) for h in allowed):
+        raise ValueError("Only YouTube, Twitch and Facebook video URLs are accepted.")
+    return url.strip()
+
+
+def duration(path):
+    result = run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)])
+    value = float(result.strip())
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("Invalid video duration")
+    return value
+
+
+def download(url, workspace, progress):
+    from yt_dlp import YoutubeDL
+    url = validate_url(url)
+    progress("Downloading source video", stage="download", percent=0)
+    output = str(workspace / "source.%(ext)s")
+    last_emit = [0.0]
+    def hook(d):
+        now = time.monotonic()
+        if d.get("status") == "downloading" and now - last_emit[0] < 0.8:
+            return
+        last_emit[0] = now
+        downloaded = d.get("downloaded_bytes") or 0
+        size = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+        p = round(100 * downloaded / size, 1) if size else None
+        progress("Downloading video" if d.get("status") != "finished" else "Download complete; merging streams", stage="download",
+                 percent=p, downloaded_bytes=downloaded, source_total_bytes=size or None,
+                 speed_bps=d.get("speed"), eta_seconds=d.get("eta"))
+    opts = {"format": "bv*+ba/b", "outtmpl": output, "noplaylist": True,
+            "merge_output_format": "mp4", "quiet": True, "no_warnings": True,
+            "retries": 5, "fragment_retries": 5, "ignoreerrors": False,
+            "progress_hooks": [hook]}
+    cookie_path = config("YTDLP_COOKIES_FILE", "").strip()
+    if cookie_path:
+        cookie = Path(cookie_path).expanduser()
+        if not cookie.is_file():
+            raise FileNotFoundError("YTDLP_COOKIES_FILE does not exist")
+        opts["cookiefile"] = str(cookie)
+    with YoutubeDL(opts) as ydl:
+        ydl.download([url])
+    candidates = [p for p in workspace.glob("source.*") if p.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov")]
+    if not candidates:
+        raise RuntimeError("Download did not produce a video. Check video access or update yt-dlp.")
+    file = max(candidates, key=lambda p: p.stat().st_size)
+    progress("Source downloaded", stage="download", percent=100, downloaded_bytes=file.stat().st_size, source_total_bytes=file.stat().st_size)
+    return file
+
+
+def ffmpeg_with_progress(command, seconds, callback, cwd=None):
+    command = [command[0], "-nostats", "-progress", "pipe:1", *command[1:]]
+    proc = subprocess.Popen([str(x) for x in command], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace", cwd=cwd)
+    # Read progress key=value lines. ffmpeg typically emits every 0.5 s.
+    last_sent = -1.0
+    for line in proc.stdout:
+        if line.startswith("out_time="):
+            clock = line.strip().split("=", 1)[1]
+            try:
+                h, m, sec = clock.split(":")
+                value = 3600 * float(h) + 60 * float(m) + float(sec)
+                percent = min(99.9, max(0, 100 * value / seconds)) if seconds else None
+                if percent is not None and percent - last_sent >= 0.5:
+                    callback(round(percent, 1))
+                    last_sent = percent
+            except (ValueError, ZeroDivisionError):
+                pass
+    err = proc.stderr.read()[-4000:]
+    if proc.wait():
+        raise RuntimeError(f"FFmpeg failed: {err}")
+    callback(100)
+
+
+def extract_audio(video, output, seconds=None, on_progress=None):
+    cmd = ["ffmpeg", "-y", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(output)]
+    if on_progress:
+        ffmpeg_with_progress(cmd, seconds, on_progress)
+    else:
+        run(cmd)
+
+
+def transcribe(audio, progress, on_progress=None):
+    from faster_whisper import WhisperModel
+    model_name = config("WHISPER_MODEL", "auto")
+    if model_name.lower() == "auto":
+        try:
+            import psutil
+            ram = psutil.virtual_memory().total / (1024 ** 3)
+        except ImportError:
+            ram = 8
+        model_name = "tiny" if ram < 6 else "base" if ram < 12 else "small"
+    device = config("WHISPER_DEVICE", "auto")
+    compute = config("WHISPER_COMPUTE_TYPE", "auto")
+    progress(f"Loading Whisper {model_name} ({device})...")
+    try:
+        model = WhisperModel(model_name, device=device, compute_type=compute)
+    except Exception as error:
+        if device == "cpu":
+            raise
+        progress(f"GPU unavailable ({type(error).__name__}); trying CPU...")
+        model = WhisperModel(model_name, device="cpu", compute_type="int8")
+    progress("Transcribing audio (first run downloads the free model)...")
+    result, info = model.transcribe(str(audio), beam_size=5, vad_filter=True, word_timestamps=True)
+    segments = []
+    audio_length = duration(audio)
+    last_update = -1
+    for seg in result:
+        if on_progress and int(seg.end * 100 / max(1, audio_length)) > last_update:
+            last_update = int(seg.end * 100 / max(1, audio_length))
+            on_progress(min(99.9, last_update))
+        segments.append({"start": float(seg.start), "end": float(seg.end), "text": seg.text.strip(),
+                         "words": [{"start": float(w.start), "end": float(w.end), "word": w.word} for w in (seg.words or [])]})
+    if on_progress:
+        on_progress(100)
+    return segments
+
+
+def make_windows(segments, length, total):
+    """Generate speech-aligned candidates from the entire transcript."""
+    if not segments:
+        # Can still clip music/gameplay, but highlights are evenly spaced rather than AI-selected.
+        return [{"start": max(0., i * max(1., total - length) / 6), "end": min(total, i * max(1., total - length) / 6 + length), "text": "", "score": 0.0} for i in range(7)]
+    windows = []
+    stride = max(8, length / 2)
+    t = 0.
+    while t < total:
+        nearby = [s for s in segments if s["end"] > t and s["start"] < t + length]
+        if nearby:
+            start = max(0, nearby[0]["start"] - 1.5)
+            end = min(total, start + length)
+            if end - start >= 8:
+                text = " ".join(s["text"] for s in nearby)
+                word_count = len(text.split())
+                richness = min(word_count / max(length * 2, 1), 1.0)
+                reactions = len(re.findall(r"\b(wow|omg|amazing|crazy|insane|wait|what|no way|laugh|funny|unbelievable|win|lost|best|secret|important|why|how|never|finally)\b|[!?]", text.lower()))
+                score = richness * 2 + min(reactions, 10) * .35
+                windows.append({"start": round(start, 2), "end": round(end, 2), "text": text[:2500], "score": round(score, 3)})
+        t += stride
+    return windows
+
+
+def ollama_rank(candidates, progress):
+    if config("OLLAMA_ENABLED", "true").lower() not in ("1", "true", "yes") or not candidates:
+        return candidates
+    progress("Ranking candidate moments with optional Ollama...")
+    # Chunk to stay within context and prevent very long streams from overwhelming the LLM.
+    url = config("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/") + "/api/generate"
+    model = config("OLLAMA_MODEL", "qwen2.5:7b")
+    for pos in range(0, len(candidates), 20):
+        block = candidates[pos:pos + 20]
+        items = [{"id": idx, "transcript": c["text"][:420]} for idx, c in enumerate(block)]
+        prompt = ("You are selecting engaging short-form video highlights. Rank each candidate based only on its transcript, "
+                  "favoring coherent hooks, payoff, surprising insights, useful explanations or funny reactions. "
+                  "Return ONLY a valid JSON array of objects with integer id and numerical score from 0 to 10. "
+                  "No markdown or extra explanation. Candidates: " + json.dumps(items, ensure_ascii=False))
+        try:
+            response = requests.post(url, json={"model": model, "prompt": prompt, "stream": False, "format": "json", "options": {"temperature": 0.1}}, timeout=150)
+            response.raise_for_status()
+            parsed = json.loads(response.json()["response"])
+            if isinstance(parsed, dict):
+                parsed = parsed.get("scores", parsed.get("results", []))
+            for item in parsed:
+                idx = item.get("id")
+                score = float(item.get("score", 0))
+                if isinstance(idx, int) and 0 <= idx < len(block):
+                    block[idx]["score"] += max(0., min(10., score)) * .6
+        except Exception as error:
+            progress(f"Ollama unavailable for one batch ({type(error).__name__}); using transcript scoring.")
+            break
+    return candidates
+
+
+def select_highlights(candidates, count):
+    picked = []
+    for item in sorted(candidates, key=lambda x: x["score"], reverse=True):
+        if all(min(item["end"], p["end"]) - max(item["start"], p["start"]) <= 0.1 * (item["end"] - item["start"]) for p in picked):
+            picked.append(item)
+        if len(picked) >= count:
+            break
+    return sorted(picked, key=lambda x: x["start"])
+
+
+def srt_timestamp(seconds):
+    ms = max(0, round(float(seconds) * 1000))
+    h, remainder = divmod(ms, 3600000)
+    m, remainder = divmod(remainder, 60000)
+    s, milliseconds = divmod(remainder, 1000)
+    return f"{h:02}:{m:02}:{s:02},{milliseconds:03}"
+
+
+def write_srt(segments, start, end, path):
+    cues = []
+    for seg in segments:
+        for word in seg.get("words") or []:
+            a = max(0., word["start"] - start)
+            b = min(end - start, word["end"] - start)
+            if b > a:
+                cues.append((a, b, word["word"].strip()))
+    # Group up to 5 words while maintaining per-phrase timestamps.
+    lines = []
+    for i in range(0, len(cues), 5):
+        group = cues[i:i + 5]
+        if group:
+            lines.append(f"{len(lines)+1}\n{srt_timestamp(group[0][0])} --> {srt_timestamp(group[-1][1])}\n{' '.join(w[2] for w in group)}\n")
+    if not lines:
+        for seg in segments:
+            a, b = max(0., seg["start"] - start), min(end-start, seg["end"] - start)
+            if b > a:
+                lines.append(f"{len(lines)+1}\n{srt_timestamp(a)} --> {srt_timestamp(b)}\n{seg['text']}\n")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return bool(lines)
+
+
+def render(video, start, end, target, segments, captions, crop_mode, width, height, preset, on_progress=None):
+    # Using a temporary ASCII-only filter_script avoids Windows path escaping bugs.
+    with tempfile.TemporaryDirectory(prefix="cliprender_") as tmp:
+        tmp = Path(tmp)
+        subs = tmp / "captions.srt"
+        has_subs = write_srt(segments, start, end, subs) if captions else False
+        if crop_mode == "center":
+            filtergraph = (f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
+                           f"crop={width}:{height},setsar=1[vbase]")
+        else:
+            filtergraph = (f"[0:v]split=2[bg][fg];"
+                           f"[bg]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},boxblur=30:2[b];"
+                           f"[fg]scale={width}:{height}:force_original_aspect_ratio=decrease[front];"
+                           f"[b][front]overlay=(W-w)/2:(H-h)/2,setsar=1[vbase]")
+        if has_subs:
+            # Running ffmpeg from temp folder keeps the subtitle path free of drive letters/colons.
+            filtergraph += (";[vbase]subtitles=captions.srt:force_style='FontName=Arial,FontSize=14,"
+                            "Alignment=2,MarginV=110,Outline=2,Shadow=1,PrimaryColour=&H00FFFFFF'[vout]")
+        else:
+            filtergraph += ";[vbase]null[vout]"
+        (tmp / "filters.txt").write_text(filtergraph, encoding="utf-8")
+        cmd = ["ffmpeg", "-y", "-ss", str(start), "-i", str(video), "-t", str(end-start),
+               "-filter_complex_script", "filters.txt", "-map", "[vout]", "-map", "0:a?",
+               "-c:v", "libx264", "-preset", preset, "-crf", "22", "-pix_fmt", "yuv420p",
+               "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(target)]
+        if on_progress:
+            # Filter script needs to resolve relative to its temporary directory.
+            cmd[cmd.index("filters.txt")] = str(tmp / "filters.txt")
+            # Subtitle filter also needs the temp working directory.
+            ffmpeg_with_progress(cmd, end-start, on_progress, cwd=tmp)
+        else:
+            run(cmd, cwd=tmp)
+
+
+def job_path(job_id):
+    if not re.fullmatch(r"[a-f0-9]{12}", str(job_id)):
+        raise ValueError("Invalid job id")
+    return DATA / str(job_id)
+
+
+def save_status(directory, data):
+    tmp = directory / "status.tmp"
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(directory / "status.json")
+
+
+def load_status(directory):
+    try:
+        return json.loads((directory / "status.json").read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+STAGE_PROGRESS = {"queued": 0, "prepare": 2, "download": 12, "audio": 47,
+                  "transcribe": 55, "analysis": 72, "render": 80, "done": 100}
+
+
+def process(job_id, *, url=None, uploaded=None, count=5, seconds=45, captions=True, crop="blur", publish=False):
+    workspace = job_path(job_id)
+    def progress(message, *, stage=None, percent=None, **fields):
+        state = load_status(workspace)
+        state["message"] = message
+        state["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        if stage is not None and stage != state.get("stage"):
+            state["stage"] = stage
+            state["stage_percent"] = None
+        if percent is not None:
+            state["stage_percent"] = percent
+        for key, value in fields.items():
+            state[key] = value
+        state["workspace_bytes"] = sum(p.stat().st_size for p in workspace.rglob("*") if p.is_file())
+        save_status(workspace, state)
+    try:
+        need_binaries()
+        progress("Preparing input", stage="prepare", percent=0)
+        if url:
+            video = download(url, workspace, progress)
+        elif uploaded:
+            video = Path(uploaded)
+            if not video.is_file() or workspace not in video.parents:
+                raise ValueError("Invalid local upload")
+        else:
+            raise ValueError("Supply a video URL or local upload")
+        total = duration(video)
+        if total < 10:
+            raise ValueError("Video must be at least 10 seconds long.")
+        seconds = min(float(seconds), total)
+        source_bytes = video.stat().st_size
+        # 16-kHz mono WAV = 32,000 bytes per second; encoded clips are variable-sized.
+        audio_estimate = int(total * 32000)
+        peak_estimate = source_bytes + audio_estimate + max(150_000_000, int(source_bytes * .25))
+        progress("Preparing speech analysis", stage="audio", percent=0,
+                 duration=total, source_bytes=source_bytes, audio_estimate_bytes=audio_estimate,
+                 estimated_peak_bytes=peak_estimate)
+        # Conservative check before creating the large temporary WAV file. The
+        # estimate is only a heuristic; also reserve 2 GiB of drive headroom.
+        free = shutil.disk_usage(workspace).free
+        if free < audio_estimate + max(150_000_000, int(source_bytes * .25)) + 2 * 1024**3:
+            raise RuntimeError("Insufficient disk headroom for audio and clips. Free additional space before processing; your downloaded source was kept.")
+        audio = workspace / "mono.wav"
+        extract_audio(video, audio, seconds=total, on_progress=lambda p: progress("Extracting audio", stage="audio", percent=p))
+        progress("Audio ready", stage="audio", percent=100)
+        def transcription_progress(message):
+            progress(message, stage="transcribe", percent=None)
+        segments = transcribe(audio, transcription_progress,
+                             on_progress=lambda p: progress("Transcribing speech", stage="transcribe", percent=p))
+        (workspace / "transcript.json").write_text(json.dumps(segments, indent=2, ensure_ascii=False), encoding="utf-8")
+        progress("Finding highlight candidates", stage="analysis", percent=20, transcript_segments=len(segments))
+        windows = make_windows(segments, seconds, total)
+        picks = select_highlights(ollama_rank(windows, lambda msg: progress(msg, stage="analysis", percent=60)), count)
+        if not picks:
+            raise RuntimeError("No clip candidates found")
+        width = int(config("VIDEO_WIDTH", 1080))
+        height = int(config("VIDEO_HEIGHT", 1920))
+        preset = config("EXPORT_PRESET", "veryfast")
+        if preset not in ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"):
+            preset = "veryfast"
+        clips = []
+        for idx, pick in enumerate(picks, 1):
+            progress(f"Rendering clip {idx} of {len(picks)}", stage="render", percent=round(100 * (idx - 1) / len(picks), 1), rendered_count=idx-1, total_clips=len(picks))
+            filename = f"clip_{idx:02}.mp4"
+            render(video, pick["start"], pick["end"], workspace / filename, segments, captions, crop, width, height, preset,
+                   on_progress=lambda p, i=idx: progress(f"Rendering clip {i} of {len(picks)}", stage="render",
+                       percent=round(100 * ((i-1)+p/100) / len(picks), 1)))
+            clips.append({"file": filename, "start": pick["start"], "end": pick["end"], "score": round(pick["score"], 2),
+                          "excerpt": pick["text"][:250], "published": None})
+            progress(f"Rendered {idx} of {len(picks)} clips", stage="render", percent=round(100 * idx / len(picks), 1), clips=clips, rendered_count=idx)
+        audio.unlink(missing_ok=True)
+        state = load_status(workspace)
+        state.update({"state": "done", "stage": "done", "stage_percent": 100,
+                      "message": f"Generated {len(clips)} clips", "clips": clips, "source": url or "local video", "duration": total})
+        save_status(workspace, state)
+    except Exception as exc:
+        state = load_status(workspace)
+        state.update({"state": "failed", "stage": "failed", "message": f"{type(exc).__name__}: {exc}"})
+        save_status(workspace, state)
+
+
+def new_job(**kwargs):
+    from threading import Thread
+    job_id = uuid.uuid4().hex[:12]
+    path = job_path(job_id)
+    path.mkdir(parents=True)
+    save_status(path, {"state": "running", "stage": "queued", "message": "Queued", "clips": [], "created": time.strftime("%Y-%m-%d %H:%M:%S")})
+    thread = Thread(target=process, args=(job_id,), kwargs=kwargs, daemon=True)
+    thread.start()
+    return job_id
