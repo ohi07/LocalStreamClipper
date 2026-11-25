@@ -58,11 +58,11 @@ def encoder_choice(requested='auto'):
     raise RuntimeError('No working H.264 encoder found. Check FFmpeg installation.')
 
 def encode_args(name, preset):
-    if name == 'cpu': return ['-c:v','libx264','-preset',preset,'-crf','23']
-    if name == 'nvenc': return ['-c:v','h264_nvenc','-preset','p4','-cq','24','-b:v','0']
-    if name == 'amf': return ['-c:v','h264_amf','-quality','balanced','-qp_i','24','-qp_p','24']
-    if name == 'qsv': return ['-c:v','h264_qsv','-global_quality','24']
-    if name == 'videotoolbox': return ['-c:v','h264_videotoolbox','-b:v','3500k']
+    if name == 'cpu': return ['-c:v','libx264','-preset',preset,'-crf','19']
+    if name == 'nvenc': return ['-c:v','h264_nvenc','-preset','p4','-cq','19','-b:v','0']
+    if name == 'amf': return ['-c:v','h264_amf','-quality','balanced','-qp_i','19','-qp_p','19']
+    if name == 'qsv': return ['-c:v','h264_qsv','-global_quality','19']
+    if name == 'videotoolbox': return ['-c:v','h264_videotoolbox','-b:v','9000k']
     raise ValueError(f'Unsupported encoder: {name}')
 
 def detect():

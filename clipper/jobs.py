@@ -40,13 +40,21 @@ def update(jid, **fields):
         return d
 
 
-def create(*, url=None, local_path=None, count=5, seconds=45, captions=True, crop='blur', quality='720', backend='yt-dlp', encoder='auto'):
+def create(*, url=None, local_path=None, count=5, seconds=45, captions=False, caption_style='clean', caption_font='Arial', caption_size=48, caption_position='auto', caption_y=72, crop='blur', quality='1080', backend='yt-dlp', encoder='auto', range_start=None, range_end=None):
     if url: core.validate_url(url)
     if local_path:
         src = Path(local_path).expanduser().resolve()
         if not src.is_file() or src.suffix.lower() not in VIDEO_SUFFIXES:
             raise ValueError('Select a valid local video file.')
     if not url and not local_path: raise ValueError('Select a video URL or local file.')
+    if (range_start is None) != (range_end is None): raise ValueError('Enter both range start and end.')
+    if range_start is not None and (range_start < 0 or range_end <= range_start or range_end-range_start > 12*3600):
+        raise ValueError('Selected segment must be positive and at most 12 hours per job.')
+    if caption_style not in ('clean','pop','minimal','karaoke'): raise ValueError('Unsupported caption effect.')
+    if caption_font not in core.CAPTION_FONTS: raise ValueError('Unsupported caption font')
+    core.scaled_caption_size(1080, caption_size)
+    core.caption_margin(1080, 1920, crop, caption_position, caption_y)
+    if range_start is not None and backend == 'mdm': raise ValueError('Time-range downloads require yt-dlp.')
     if not 1 <= count <= 20 or not 15 <= seconds <= 180 or crop not in ('blur','center'):
         raise ValueError('Invalid clipping settings')
     if quality not in ('480','720','1080','best'): raise ValueError('Invalid source quality')
@@ -57,7 +65,8 @@ def create(*, url=None, local_path=None, count=5, seconds=45, captions=True, cro
     core.save_status(dest, {'id':jid,'state':'queued','stage':'queued', 'stage_percent':0,
       'message':'Queued for processing', 'created':now(), 'updated':now(), 'clips':[],
       'source':url or local_path, 'url':url, 'local_path':str(Path(local_path).resolve()) if local_path else None,
-      'count':count,'seconds':seconds,'captions':captions,'crop':crop,'quality':quality,'backend':backend,'encoder':encoder,
+      'count':count,'seconds':seconds,'captions':captions,'caption_style':caption_style,'caption_font':caption_font,'caption_size':caption_size,'caption_position':caption_position,'caption_y':caption_y,'crop':crop,'quality':quality,'backend':backend,'encoder':encoder,
+      'range_start':range_start,'range_end':range_end,'source_title':None,
       'downloaded_bytes':0,'retry_count':0,'rendered_count':0})
     return jid
 
@@ -142,7 +151,28 @@ def source_file(folder):
 
 
 def detect_quality(q):
-    return 'bv*[height<=%s]+ba/b[height<=%s]/best[height<=%s]'%(q,q,q) if q!='best' else 'bv*+ba/b'
+    return ('bv*[height<=%s]+ba/b[height<=%s]/b[height<=%s]/bv*+ba/b' % (q,q,q) if q!='best' else 'bv*+ba/b')
+
+
+def source_metadata(jid, s):
+    """Fetch public source title and duration without downloading media."""
+    folder = path(jid)
+    metadata_path = folder / 'source_metadata.json'
+    if metadata_path.is_file():
+        try: return json.loads(metadata_path.read_text(encoding='utf-8'))
+        except (ValueError, OSError): pass
+    args=[sys.executable,'-m','yt_dlp','--dump-single-json','--skip-download','--no-playlist','--no-warnings',s['url']]
+    try:
+        result=subprocess.run(args, capture_output=True,text=True,timeout=70,encoding='utf-8',errors='replace')
+        if result.returncode: raise RuntimeError(result.stderr[-300:])
+        raw=json.loads(result.stdout)
+        meta={'title':str(raw.get('title') or 'Untitled video')[:250],
+              'uploader':str(raw.get('uploader') or '')[:120],
+              'duration':raw.get('duration'), 'webpage_url':str(raw.get('webpage_url') or s['url'])}
+        metadata_path.write_text(json.dumps(meta,ensure_ascii=False),encoding='utf8')
+        return meta
+    except (OSError,ValueError,RuntimeError,subprocess.TimeoutExpired):
+        return {'title':'Video highlights','duration':None,'uploader':'','webpage_url':s['url']}
 
 
 def download(jid,s):
@@ -158,7 +188,8 @@ def download(jid,s):
         return p
     if s['backend']=='mdm':
         return download_mdm(jid,s)
-    update(jid,stage='download',stage_percent=None,message='Connecting to source (resumable download)',downloaded_bytes=0)
+    meta=source_metadata(jid,s)
+    update(jid,source_title=meta.get('title'),original_duration=meta.get('duration'),uploader=meta.get('uploader'),stage='download',stage_percent=None,message='Connecting to source (resumable where supported)',downloaded_bytes=0)
     fmt=detect_quality(s['quality'])
     args=[sys.executable,'-m','yt_dlp','--newline','--continue','--no-overwrites',
           '--no-playlist','--retries','10','--fragment-retries','10','--extractor-retries','8',
@@ -166,6 +197,10 @@ def download(jid,s):
           '--socket-timeout','25','--merge-output-format','mp4',
           '--format',fmt,'--output',str(folder/'source.%(ext)s'),
           '--progress-template','download:CLIPPROGRESS %(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s',s['url']]
+    if s.get('range_start') is not None:
+        # FFmpeg-backed yt-dlp sectional retrieval: fetch only the requested part when supported.
+        args[3:3]=['--download-sections',f"*{s['range_start']}-{s['range_end']}"]
+        update(jid,message='Retrieving selected time window, not full stream (provider support required)')
     cookie=core.config('YTDLP_COOKIES_FILE','').strip()
     if cookie: args[3:3]=['--cookies',cookie]
     last=[0]
@@ -192,7 +227,7 @@ def download(jid,s):
         raise
     result=source_file(folder)
     if not result: raise RuntimeError('No playable file produced. Check access and video format.')
-    update(jid,stage_percent=100,source_bytes=result.stat().st_size,source_ready=True,message='Download complete')
+    update(jid,stage_percent=100,source_bytes=result.stat().st_size,source_ready=True,message='Selected section downloaded' if s.get('range_start') is not None else 'Download complete')
     return result
 
 
@@ -249,6 +284,15 @@ def run_job(jid):
         video=download(jid,s)
         check(jid)
         total=core.duration(video)
+        if s.get('local_path') and s.get('range_start') is not None:
+            section=folder/'source_section.mp4'
+            if not valid_video(section):
+                ensure_disk(jid, max(100_000_000,int(video.stat().st_size*(s['range_end']-s['range_start'])/total*1.5)))
+                ffmpeg(jid,['-ss',str(s['range_start']),'-i',str(video),'-t',str(s['range_end']-s['range_start']),'-map','0:v:0','-map','0:a?','-c:v','libx264','-preset','veryfast','-crf','20','-c:a','aac','-b:a','160k','-movflags','+faststart',str(section.with_suffix('.partial.mp4'))],s['range_end']-s['range_start'],'download')
+                section.with_suffix('.partial.mp4').replace(section)
+            video=section;total=core.duration(video)
+        if not s.get('source_title'):
+            update(jid,source_title=Path(s.get('local_path') or 'Video highlights').stem)
         if total<10: raise ValueError('Source must be at least 10 seconds long')
         audio=folder/'mono.wav'; transcript=folder/'transcript.json'; picks_file=folder/'highlights.json'
         audio_estimate=int(total*32000)
@@ -302,7 +346,8 @@ def run_job(jid):
                 # core.render's FFmpeg progress is not pausable; custom rendering
                 # calls core.filter pipeline via a cancellable Popen below.
                 render_cancellable(jid,video,pick,segments,out,s,i,len(picks),width,height,preset,chosen_encoder)
-            clips.append({'file':out.name,'start':pick['start'],'end':pick['end'],
+            clips.append({'file':out.name,'title':suggest_title(state(jid).get('source_title'),pick['text'],i),
+                          'source_start':round(pick['start']+(s.get('range_start') or 0),2), 'start':pick['start'],'end':pick['end'],
                           'score':round(pick['score'],2),'excerpt':pick['text'][:250], 'published':None})
             update(jid,clips=clips,rendered_count=len(clips),stage_percent=round(i*100/len(picks),1))
         update(jid,state='done',stage='done',stage_percent=100,message=f'Generated {len(clips)} clips',clips=clips)
@@ -316,6 +361,15 @@ def run_job(jid):
     except Exception as e:
         # Always preserve completed artifacts; never delete input or transcript.
         update(jid,state='failed',message=f'{type(e).__name__}: {str(e)[-700:]}')
+
+
+def suggest_title(original, excerpt, number):
+    """Offline, editable title suggestion from source metadata and dialogue."""
+    title=re.sub(r'\s+', ' ', (original or 'Stream highlight')).strip()
+    title=re.sub(r'(?i)\b(full stream|livestream|vod|official)\b', '', title).strip(' -|:') or 'Stream highlight'
+    # Prefer source metadata rather than inventing an event the model cannot verify.
+    title=title[:75].rstrip()
+    return f'{title} — Highlight {number} #Shorts'[:100]
 
 
 def valid_video(p):
@@ -342,23 +396,18 @@ def render_cancellable(jid,video,pick,segments,out,s,index,n,width,height,preset
     with tempfile.TemporaryDirectory(prefix='lsc_v3_') as tmpdir:
         tmp=Path(tmpdir)
         subs=tmp/'captions.srt'
-        has_sub=core.write_srt(segments,pick['start'],pick['end'],subs) if s['captions'] else False
-        if s['crop']=='center':
-            graph=(f'[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1[vbase]')
+        if s['captions'] and s.get('caption_style') == 'karaoke':
+            has_sub=core.write_karaoke_ass(segments,pick['start'],pick['end'],tmp/'captions.ass',width,height,s['crop'],s.get('caption_font','Arial'),s.get('caption_size',48),s.get('caption_position','auto'),s.get('caption_y',72))
         else:
-            graph=(f'[0:v]split=2[bg][fg];[bg]scale={width}:{height}:force_original_aspect_ratio=increase,'
-                   f'crop={width}:{height},boxblur=30:2[b];[fg]scale={width}:{height}:force_original_aspect_ratio=decrease[front];'
-                   f'[b][front]overlay=(W-w)/2:(H-h)/2,setsar=1[vbase]')
-        if has_sub:
-            graph+=(";[vbase]subtitles=captions.srt:force_style='FontName=Arial,FontSize=14,Alignment=2,MarginV=110,Outline=2,Shadow=1'[vout]")
-        else: graph+=';[vbase]null[vout]'
+            has_sub=core.write_srt(segments,pick['start'],pick['end'],subs) if s['captions'] else False
+        graph=core.vertical_filtergraph(width,height,s['crop'],has_sub, s.get('caption_style','clean'), s.get('caption_font','Arial'), s.get('caption_size',48), s.get('caption_position','auto'), s.get('caption_y',72))
         (tmp/'filters.txt').write_text(graph,encoding='utf8')
         partial=out.with_suffix('.partial.mp4')
         partial.unlink(missing_ok=True)
         seconds=pick['end']-pick['start']
         args=['-ss',str(pick['start']),'-i',str(video),'-t',str(seconds),'-filter_complex_script','filters.txt',
               '-map','[vout]','-map','0:a?',*hardware.encode_args(encoder,preset),'-pix_fmt','yuv420p',
-              '-c:a','aac','-b:a','128k','-movflags','+faststart',str(partial)]
+              '-c:a','aac','-b:a','192k','-movflags','+faststart',str(partial)]
         render_command(jid,args,tmp,seconds,index,n)
         partial.replace(out)
 

@@ -34,9 +34,16 @@ class URLJob(BaseModel):
     url: str
     count: int = Field(default=5, ge=1, le=20)
     seconds: int = Field(default=45, ge=15, le=180)
-    captions: bool = True
+    captions: bool = False
+    caption_style: str = "clean"
+    caption_font: str = "Arial"
+    caption_size: int = Field(default=48, ge=24, le=80)
+    caption_position: str = "auto"
+    caption_y: int = Field(default=72, ge=10, le=90)
+    range_start: float | None = Field(default=None, ge=0)
+    range_end: float | None = Field(default=None, gt=0)
     crop: str = "blur"
-    quality: str = "720"
+    quality: str = "1080"
     backend: str = "yt-dlp"
     encoder: str = "auto"
 
@@ -91,7 +98,7 @@ def job(job_id: str):
 def url_job(data: URLJob):
     try:
         jid = manager.create(url=data.url, count=data.count, seconds=data.seconds,
-              captions=data.captions, crop=data.crop, quality=data.quality, backend=data.backend, encoder=data.encoder)
+              captions=data.captions, caption_style=data.caption_style, caption_font=data.caption_font, caption_size=data.caption_size, caption_position=data.caption_position, caption_y=data.caption_y, crop=data.crop, quality=data.quality, backend=data.backend, encoder=data.encoder, range_start=data.range_start, range_end=data.range_end)
         return {"id": jid}
     except ValueError as e:
         raise HTTPException(422, str(e))
@@ -104,7 +111,7 @@ class LocalJob(URLJob):
 def local_job(data: LocalJob):
     try:
         jid=manager.create(local_path=data.path,count=data.count,seconds=data.seconds,
-             captions=data.captions,crop=data.crop,quality=data.quality,encoder=data.encoder)
+             captions=data.captions,caption_style=data.caption_style,caption_font=data.caption_font,caption_size=data.caption_size,caption_position=data.caption_position,caption_y=data.caption_y,crop=data.crop,quality=data.quality,encoder=data.encoder,range_start=data.range_start,range_end=data.range_end)
         return {"id":jid}
     except ValueError as e:
         raise HTTPException(422, str(e))

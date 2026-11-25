@@ -146,16 +146,31 @@ def transcribe(audio, progress, on_progress=None):
         progress(f"GPU unavailable ({type(error).__name__}); trying CPU...")
         model = WhisperModel(model_name, device="cpu", compute_type="int8")
     progress("Transcribing audio (first run downloads the free model)...")
-    result, info = model.transcribe(str(audio), beam_size=5, vad_filter=True, word_timestamps=True)
+    def iterate_whisper(active_model):
+        # CTranslate2 may load cuBLAS lazily at iteration rather than on model init.
+        result, info = active_model.transcribe(str(audio), beam_size=5, vad_filter=True, word_timestamps=True)
+        for segment in result:
+            yield segment
     segments = []
     audio_length = duration(audio)
     last_update = -1
-    for seg in result:
-        if on_progress and int(seg.end * 100 / max(1, audio_length)) > last_update:
-            last_update = int(seg.end * 100 / max(1, audio_length))
-            on_progress(min(99.9, last_update))
-        segments.append({"start": float(seg.start), "end": float(seg.end), "text": seg.text.strip(),
-                         "words": [{"start": float(w.start), "end": float(w.end), "word": w.word} for w in (seg.words or [])]})
+    def consume(active_model):
+        nonlocal last_update
+        for seg in iterate_whisper(active_model):
+            if on_progress and int(seg.end * 100 / max(1, audio_length)) > last_update:
+                last_update = int(seg.end * 100 / max(1, audio_length))
+                on_progress(min(99.9, last_update))
+            segments.append({"start": float(seg.start), "end": float(seg.end), "text": seg.text.strip(),
+                             "words": [{"start": float(w.start), "end": float(w.end), "word": w.word} for w in (seg.words or [])]})
+    try:
+        consume(model)
+    except (RuntimeError, OSError) as error:
+        if device == 'cpu' or not any(x in str(error).lower() for x in ('cublas', 'cudnn', 'cuda', 'cudart')):
+            raise
+        progress(f'CUDA transcription failed ({type(error).__name__}); restarting transcription on CPU')
+        segments.clear()
+        last_update = -1
+        consume(WhisperModel(model_name, device='cpu', compute_type='int8'))
     if on_progress:
         on_progress(100)
     return segments
@@ -257,31 +272,132 @@ def write_srt(segments, start, end, path):
     return bool(lines)
 
 
+def write_karaoke_ass(segments, start, end, path, width=1080, height=1920, crop_mode='blur', caption_font='Arial', caption_size=48, caption_position='auto', caption_y=72):
+    """Word-highlight karaoke subtitles using libass; returns False for silent clips."""
+    def clock(sec):
+        cs=max(0,int(round(sec*100)))
+        h, r=divmod(cs,360000);m,r=divmod(r,6000);t,c=divmod(r,100)
+        return f'{h}:{m:02}:{t:02}.{c:02}'
+    words=[]
+    for seg in segments:
+        for word in seg.get('words') or []:
+            a=max(0.,float(word['start'])-start);b=min(end-start,float(word['end'])-start)
+            if b>a:
+                txt=str(word.get('word','')).strip().replace('\\','').replace('{','(').replace('}',')').replace('\n',' ')
+                if txt: words.append((a,b,txt))
+    if not words:return False
+    fontsize=scaled_caption_size(width, caption_size)
+    margin=caption_margin(width, height, crop_mode, caption_position, caption_y)
+    hdr=(f'[Script Info]\nScriptType: v4.00+\nPlayResX: {width}\nPlayResY: {height}\nWrapStyle: 0\n'
+         '[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\n'
+         f'Style: Karaoke,{caption_font},{fontsize},&H00FFFFFF,&H0000D0FF,&H00000000,&H70000000,-1,0,0,0,100,100,0,0,1,3,1,2,70,70,{margin},1\n'
+         '[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n')
+    lines=[]
+    for index in range(0,len(words),5):
+        grp=words[index:index+5]
+        a=grp[0][0];b=grp[-1][1]
+        pieces=[]; last=a
+        for wa,wb,txt in grp:
+            # Include inter-word gaps in karaoke duration.
+            dur=max(1,round((wb-last)*100))
+            pieces.append(r'{\kf'+str(dur)+'}'+txt)
+            last=wb
+        lines.append(f'Dialogue: 0,{clock(a)},{clock(b)},Karaoke,,0,0,0,,{{\fad(120,120)}}'+' '.join(pieces))
+    path.write_text(hdr+'\n'.join(lines)+'\n',encoding='utf-8')
+    return True
+
+
+CAPTION_FONTS = ('Arial', 'Verdana', 'Trebuchet MS', 'Impact', 'DejaVu Sans', 'Liberation Sans', 'Noto Sans')
+CAPTION_POSITIONS = ('auto', 'below', 'bottom', 'center', 'top', 'custom')
+
+
+def scaled_caption_size(width, caption_size):
+    if not isinstance(caption_size, int) or not (24 <= caption_size <= 80):
+        raise ValueError('Caption font size must be between 24 and 80 at 1080p')
+    return max(12, round(caption_size * width / 1080))
+
+
+def caption_margin(width, height, crop_mode='blur', caption_position='auto', caption_y=72):
+    if caption_position not in CAPTION_POSITIONS:
+        raise ValueError('Invalid caption positioning preset')
+    if not isinstance(caption_y, int) or not 10 <= caption_y <= 90:
+        raise ValueError('Custom vertical position must be 10–90%')
+    effective = ('below' if crop_mode == 'blur' else 'bottom') if caption_position == 'auto' else caption_position
+    if effective == 'below':
+        # Source 16:9 frame is centered in a portrait output; place captions
+        # just underneath it. 16:9 footage is approximately width*9/16 tall.
+        content_bottom = (height + min(height, width * 9 / 16)) / 2
+        baseline = content_bottom + height * .065
+    elif effective == 'bottom':
+        baseline = height * .82
+    elif effective == 'center':
+        baseline = height * .53
+    elif effective == 'top':
+        baseline = height * .21
+    else:
+        baseline = height * caption_y / 100
+    # libass Alignment=2: margin measures baseline offset from bottom.
+    return max(round(height * .07), min(round(height * .88), round(height - baseline)))
+
+
+def vertical_filtergraph(width, height, crop_mode='blur', has_subs=False, caption_style='clean', caption_font='Arial', caption_size=48, caption_position='auto', caption_y=72):
+    """Correctly composite portrait H.264 frames, with explicit pixel formats.
+
+    Explicit yuv420p before and after overlay avoids mismatched pixel format
+    negotiation which can produce green artifacts on some FFmpeg builds.
+    """
+    if width <= 0 or height <= 0 or width % 2 or height % 2:
+        raise ValueError('Output dimensions must be positive even integers')
+    if crop_mode == 'center':
+        graph=(f'[0:v]scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos,'
+               f'crop={width}:{height},setsar=1,format=yuv420p[vbase]')
+    elif crop_mode == 'blur':
+        graph=(f'[0:v]format=yuv420p,setsar=1,split=2[bg][fg];'
+               f'[bg]scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos,'
+               f'crop={width}:{height},setsar=1,boxblur=luma_radius=30:luma_power=2:'
+               f'chroma_radius=15:chroma_power=2,format=yuv420p[back];'
+               f'[fg]scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos,'
+               f'pad=ceil(iw/2)*2:ceil(ih/2)*2,setsar=1,format=yuv420p[front];'
+               f'[back][front]overlay=x=(W-w)/2:y=(H-h)/2:format=yuv420:shortest=1,'
+               f'format=yuv420p[vbase]')
+    else:
+        raise ValueError('Unknown framing mode')
+    if has_subs:
+        # ASS-style captions: font scales with original script canvas. The margin
+        # places text below the central 16:9 gameplay band in blurred mode.
+        # We use 2-line SRT cues; the styling is conservative and readable.
+        if caption_style not in ('clean','pop','minimal','karaoke'):
+            raise ValueError('Invalid caption style')
+        if caption_font not in CAPTION_FONTS:
+            raise ValueError('Unsupported caption font')
+        font_size = scaled_caption_size(width, caption_size)
+        if caption_style == 'minimal': font_size = max(12, round(font_size * .83))
+        margin = caption_margin(width, height, crop_mode, caption_position, caption_y)
+        outline = 3 if caption_style == 'pop' else 2
+        bold = 1 if caption_style == 'pop' else 0
+        shadow = 1 if caption_style == 'pop' else 0
+        subtitle_file = 'captions.ass' if caption_style == 'karaoke' else 'captions.srt'
+        graph+=(f";[vbase]subtitles={subtitle_file}:force_style='FontName={caption_font},FontSize={font_size},"
+                f"Bold={bold},Alignment=2,MarginV={margin},MarginL=70,MarginR=70,"
+                f"Outline={outline},Shadow={shadow},PrimaryColour=&H00FFFFFF,"
+                "OutlineColour=&H00000000'[captioned];[captioned]format=yuv420p[vout]")
+    else:
+        graph+=';[vbase]null[vout]'
+    return graph
+
+
 def render(video, start, end, target, segments, captions, crop_mode, width, height, preset, on_progress=None):
     # Using a temporary ASCII-only filter_script avoids Windows path escaping bugs.
     with tempfile.TemporaryDirectory(prefix="cliprender_") as tmp:
         tmp = Path(tmp)
         subs = tmp / "captions.srt"
         has_subs = write_srt(segments, start, end, subs) if captions else False
-        if crop_mode == "center":
-            filtergraph = (f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
-                           f"crop={width}:{height},setsar=1[vbase]")
-        else:
-            filtergraph = (f"[0:v]split=2[bg][fg];"
-                           f"[bg]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},boxblur=30:2[b];"
-                           f"[fg]scale={width}:{height}:force_original_aspect_ratio=decrease[front];"
-                           f"[b][front]overlay=(W-w)/2:(H-h)/2,setsar=1[vbase]")
-        if has_subs:
-            # Running ffmpeg from temp folder keeps the subtitle path free of drive letters/colons.
-            filtergraph += (";[vbase]subtitles=captions.srt:force_style='FontName=Arial,FontSize=14,"
-                            "Alignment=2,MarginV=110,Outline=2,Shadow=1,PrimaryColour=&H00FFFFFF'[vout]")
-        else:
-            filtergraph += ";[vbase]null[vout]"
+        filtergraph = vertical_filtergraph(width, height, crop_mode, has_subs)
         (tmp / "filters.txt").write_text(filtergraph, encoding="utf-8")
         cmd = ["ffmpeg", "-y", "-ss", str(start), "-i", str(video), "-t", str(end-start),
                "-filter_complex_script", "filters.txt", "-map", "[vout]", "-map", "0:a?",
-               "-c:v", "libx264", "-preset", preset, "-crf", "22", "-pix_fmt", "yuv420p",
-               "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(target)]
+               "-c:v", "libx264", "-preset", preset, "-crf", "19", "-pix_fmt", "yuv420p",
+               "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(target)]
         if on_progress:
             # Filter script needs to resolve relative to its temporary directory.
             cmd[cmd.index("filters.txt")] = str(tmp / "filters.txt")

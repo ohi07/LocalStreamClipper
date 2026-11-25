@@ -35,3 +35,40 @@ Video transcription and local analysis run on your PC. Ollama runs locally when 
 - Slow transcribe: set `WHISPER_MODEL=tiny` or `base`.
 - Stuck waiting for internet: choose Resume to try immediately; check provider website availability.
 - Stale job after a sudden shutdown: reopen and Resume. It may redo the interrupted stage.
+
+
+## Quality and portrait clips (Final release)
+
+The default input quality is **1080p preferred**: choose the highest source stream at or below 1080p when available; if only a higher-resolution source can be obtained it falls back to the highest available. A lower-resolution source cannot be genuinely upgraded to native 1080p. The **Best available** option may download 1440p/4K/8K and use substantially more disk space. Input quality is different from output resolution; the output remains a 9:16 portrait video at 1080×1920 on sufficiently capable machines. Low-RAM machines can automatically use lower-resolution output for stability.
+
+The blur renderer explicitly normalizes both video branches to yuv420p, composites them with overlay, and writes portrait H.264; use **Center crop** if the blurred background is undesirable. Video encoding is hardware-tested and CPU fallback is available. Captions are burned into the final video.
+
+If CUDA transcription fails because cuBLAS/cuDNN is unavailable, the transcription engine attempts to restart the stage on CPU. This is slower but should preserve downloads, audio files, and checkpoints.
+
+Live and expired sources may not support resumption; only videos you are authorized to use should be processed. YouTube publishing requires separate OAuth authorization.
+
+
+### Processing a 24-hour VOD without the full download
+Enter a completed stream URL, set **Start** `13:20:00` and **End** `13:50:00`, and select **yt-dlp**. The app requests only that window. It still transcribes the selected window to score highlights. Some providers lack seekable streams; download may fail, require additional data, or refuse section retrieval. For pause/resume reliability, full VOD downloads with partial files are often more robust; a partial-section download may restart the section after a disconnect.
+
+### Subtitles and titles
+Uncheck **Burn subtitles** for no overlaid AI captions. Select Pop for bold outlined captions or Minimal for smaller text. Game subtitles already embedded in the original footage cannot be removed this way. Source metadata is retrieved to produce an editable title; review before uploading.
+
+### Preview troubleshooting
+Modern browsers support HTTP Range requests for MP4, but preview can fail with unsupported codecs or broken media. Download the clip and test it with VLC. Video outputs target H.264 / AAC / yuv420p.
+
+**Karaoke** animates word highlighting using Whisper word-level timestamps; if transcription does not supply word timings, captions can be absent in this style.
+
+
+## Caption typography and placement
+
+Caption overlays are **off by default**. When enabled, set Caption Effect, Caption Font, Caption Position and Font Size before creating a job. Font choices: Arial, Verdana, Trebuchet MS, Impact, DejaVu Sans, Liberation Sans or Noto Sans. Fonts must be installed locally; libass may substitute when missing. No font files are bundled.
+
+- **Auto** puts subtitles below the central widescreen gameplay with Blurred Background, and at a bottom safe area with Center Crop.
+- **Below gameplay** is best for GTA, gameplay HUDs and landscape footage with blurred fill.
+- **Bottom safe zone** keeps the text above the lowest UI region, but can overlap widescreen gameplay.
+- **Top/Center** are optional alternatives.
+- **Custom** enables a vertical placement slider, measured from the top of the full portrait frame.
+- **Font size** defaults to 48px (1080p equivalent), automatically scaled for smaller exports.
+
+Caption settings are saved per job; re-export or start a new job to apply changes to an existing MP4. Captions baked into the source video cannot be removed using this setting. For an accurate local preview, render a short test clip first.
